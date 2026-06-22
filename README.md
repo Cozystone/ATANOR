@@ -115,6 +115,12 @@ Cloud Brain and Atlas visualize public graph-fragment state without claiming pri
 
 ![ATANOR Cloud Brain Atlas](docs/media/atanor-cloud-atlas.png)
 
+### Cloud Graph
+
+The Cloud Graph tab keeps public semantic fragments readable by giving the graph canvas priority and reducing layer diagnostics to a compact summary strip.
+
+![ATANOR Cloud Graph](docs/media/cloud-tab-compact-panel.png)
+
 ## Architecture In One Picture
 
 ```text
@@ -216,6 +222,9 @@ npm --workspace apps/web run build
 
 # Run the publication test suite used for this release snapshot
 python -m pytest apps/api/tests packages/rag_engine/tests packages/cloud_brain/tests packages/seed_research/tests packages/cortex_g2/tests packages/q_cortex/tests packages/surface_brain/tests packages/answer_quality/tests packages/base_brain/tests packages/brain_graph/tests packages/graph_hub/tests -q
+
+# Run the release mock/scaffold risk gate; release blockers must stay at zero
+python scripts/audit_release_mock_risks.py
 
 # Run both API and web with the root convenience script
 npm run dev

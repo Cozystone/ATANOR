@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,9 @@ from packages.cloud_brain.proof_semantic_growth import run_semantic_cloud_growth
 from packages.cloud_brain.prove_controlled_self_growth import write_controlled_self_growth_proof
 from packages.cloud_brain.remote_proof import load_last_remote_proof, write_remote_cloud_brain_proof
 from packages.cloud_brain.prove_spherical_chunk_materialization import write_spherical_chunk_materialization_proof
+from packages.cloud_brain.anna_archive_provider import fetch_metadata as fetch_anna_archive_metadata
+from packages.cloud_brain.anna_archive_provider import load_config as load_anna_archive_config
+from packages.cloud_brain.anna_archive_provider import metadata_to_semantic_text as anna_metadata_to_semantic_text
 from packages.cloud_brain.sphere_materialization import (
     get_cloud_node,
     get_sphere_tile,
@@ -30,11 +35,21 @@ from packages.cloud_brain.sphere_materialization import (
     materialize_sphere_tile,
     sphere_manifest,
 )
-from packages.cloud_brain.web_seed_feeder import feeder_status
+from packages.cloud_brain.web_seed_feeder import feeder_status, run_once as run_web_seed_feeder_once
 from packages.cloud_brain.semantic_attach import attach_semantic_cloud_for_query
-from packages.cloud_brain.semantic_growth import ingest_semantic_source
+from packages.cloud_brain.semantic_growth import MAX_ACCELERATION_BATCH_SIZE, ingest_semantic_acceleration_batch, ingest_semantic_source
 from packages.cloud_brain.semantic_handoff import write_semantic_cloud_growth_handoff
-from packages.cloud_brain.semantic_store import SemanticCloudStore, get_semantic_cloud_growth_status
+from packages.cloud_brain.semantic_store import get_semantic_cloud_growth_status
+from packages.cloud_brain.bounded_learning_runner import (
+    BoundedLearningRunConfig,
+    DEFAULT_TARGET_STORE,
+    assess_24h_readiness,
+    run_bounded_candidate_learning,
+)
+from packages.cloud_brain.read_model import build_cloud_read_model, load_fast_graph_sample
+from packages.cloud_brain.continuous_learning import CloudSurfaceLearningLoop
+from packages.cloud_brain.candidate_read_model import candidate_cloud_graph, candidate_cloud_status
+from packages.cloud_brain.verified_payload_feeder import PayloadSourcePolicy, VerifiedPayloadFeeder, payload_from_mapping
 from rag_engine.ghost_graph import GhostTopology
 from rag_engine.fusion import epistemic_uncertainty, local_density_score, route_ratio, weighted_rrf
 
@@ -79,6 +94,91 @@ class SemanticCloudIngestRequest(BaseModel):
 class SemanticCloudAttachRequest(BaseModel):
     query: str = Field(min_length=1, max_length=400)
     limit: int = Field(default=8, ge=1, le=48)
+
+
+class SemanticCloudAccelerateRequest(BaseModel):
+    batch_size: int = Field(default=1000, ge=1, le=MAX_ACCELERATION_BATCH_SIZE)
+    async_run: bool = False
+
+
+_SEMANTIC_ACCELERATION_LOCK = threading.Lock()
+_SEMANTIC_ACCELERATION_STATE: dict[str, Any] = {
+    "running": False,
+    "last_result": None,
+    "last_error": None,
+}
+
+
+def _run_semantic_acceleration_batch(batch_size: int) -> None:
+    if not _SEMANTIC_ACCELERATION_LOCK.acquire(blocking=False):
+        return
+    try:
+        _SEMANTIC_ACCELERATION_STATE.update({"running": True, "last_error": None})
+        result = ingest_semantic_acceleration_batch(batch_size=batch_size)
+        _SEMANTIC_ACCELERATION_STATE.update({"last_result": result, "last_error": None})
+    except Exception as exc:
+        _SEMANTIC_ACCELERATION_STATE.update({"last_error": str(exc)})
+    finally:
+        _SEMANTIC_ACCELERATION_STATE["running"] = False
+        _SEMANTIC_ACCELERATION_LOCK.release()
+
+
+class WebSeedFeederRunRequest(BaseModel):
+    force_enabled: bool = False
+    force_fetch: bool = False
+    max_sources: int | None = Field(default=None, ge=1, le=1000)
+
+
+class CloudLearningPayloadModel(BaseModel):
+    payload_id: str | None = Field(default=None, max_length=240)
+    source_type: str = Field(default="manual_public_sentence", max_length=120)
+    source_id: str = Field(min_length=1, max_length=240)
+    text: str = Field(min_length=1, max_length=2000)
+    language: str = Field(default="ko", pattern="^(ko|en|unknown)$")
+    provenance_hash: str | None = Field(default=None, max_length=128)
+    source_url_or_path: str = Field(default="", max_length=800)
+    license_hint: str = Field(default="CC BY-SA 4.0", max_length=120)
+    collected_at: str | None = Field(default=None, max_length=80)
+    is_private: bool = False
+    is_generated: bool = False
+    is_eval_row: bool = False
+    quality_flags: list[str] = Field(default_factory=list)
+    target_store: str = Field(default="verified_store_v0_candidate", pattern="^(verified_store_v0_candidate|verified_store_v0)$")
+    learning_mode: str = Field(default="semantic_graph", max_length=80)
+
+
+class CloudLearningRunRequest(BaseModel):
+    dry_run: bool = False
+    max_payloads_per_tick: int = Field(default=25, ge=1, le=100)
+    max_accepted_per_run: int = Field(default=25, ge=1, le=100)
+    promote_to_verified: bool = False
+    candidate_store_root: str | None = Field(default=None, max_length=800)
+    payloads: list[CloudLearningPayloadModel] = Field(default_factory=list)
+
+
+class CloudLearningRunCappedRequest(BaseModel):
+    profile: str = Field(default="interactive_safe", pattern="^(interactive_safe|24h_balanced|night_max)$")
+    max_payloads: int | None = Field(default=1000, ge=1, le=200000)
+    max_seconds: int | None = Field(default=300, ge=1, le=86400)
+    max_store_mb: float | None = Field(default=256.0, ge=0.001, le=100000.0)
+    min_ram_free_gb: float = Field(default=8.0, ge=0.0, le=1024.0)
+    min_disk_free_gb: float = Field(default=40.0, ge=0.0, le=100000.0)
+    max_cpu_percent: float | None = Field(default=80.0, ge=1.0, le=100.0)
+    max_candidate_files: int | None = Field(default=64, ge=1, le=10000)
+    dry_run: bool = True
+    execute: bool = False
+    target_candidate_store: str | None = Field(default=None, max_length=800)
+    promote_to_verified: bool = False
+    target_payloads_per_second: float | None = Field(default=None, ge=0.001, le=1000.0)
+    target_duration_seconds: int | None = Field(default=None, ge=1, le=86400)
+    min_source_rows_for_target_duration: int | None = Field(default=None, ge=1, le=10000000)
+    pacing_mode: str = Field(default="none", pattern="^(none|sleep_between_batches|token_bucket)$")
+    payloads: list[CloudLearningPayloadModel] = Field(default_factory=list)
+
+
+class AnnaArchiveMetadataSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=240)
+    ingest: bool = False
 
 
 def _controlled_growth_summary_from_proof(proof: dict[str, Any] | None, *, proof_exists: bool) -> dict[str, Any]:
@@ -304,6 +404,11 @@ def _status_shell(daemon: dict[str, Any], memory: dict[str, Any] | None = None) 
     cloud_state = graph_states["cloud"]
     local_state = graph_states["local"]
     proof_store = cloud_store_status()
+    semantic_status = get_semantic_cloud_growth_status()
+    semantic_nodes = int(semantic_status.get("concepts") or semantic_status.get("node_count") or 0)
+    semantic_edges = int(semantic_status.get("relations") or semantic_status.get("edge_count") or 0)
+    cloud_nodes = semantic_nodes or int(cloud_state.get("cloud_total_nodes") or 0) + int(proof_store.get("cloud_total_nodes") or 0)
+    cloud_edges = semantic_edges or int(cloud_state.get("cloud_total_relations") or 0) + int(proof_store.get("cloud_total_edges") or 0)
     web_feeder_state = feeder_status()
     audit = graph_states.get("audit") or {
         "operator_graph_source": cloud_state.get("source", "unavailable"),
@@ -320,20 +425,25 @@ def _status_shell(daemon: dict[str, Any], memory: dict[str, Any] | None = None) 
         "public_cloud_backend_enabled": False,
         "local_required": True,
         "counts": {
-            "nodes": int(cloud_state.get("cloud_total_nodes") or 0) + int(proof_store.get("cloud_total_nodes") or 0),
-            "edges": int(cloud_state.get("cloud_total_relations") or 0) + int(proof_store.get("cloud_total_edges") or 0),
+            "nodes": cloud_nodes,
+            "edges": cloud_edges,
             "events": int(memory.get("event_count") or daemon.get("latest_event_count") or 0),
             "rounds": int(daemon.get("total_rounds") or 0),
             "learned_rounds": int(daemon.get("learned_rounds") or 0),
         },
         "cloud_graph_state": {
             **cloud_state,
-            "cloud_total_nodes": int(cloud_state.get("cloud_total_nodes") or 0) + int(proof_store.get("cloud_total_nodes") or 0),
-            "cloud_total_relations": int(cloud_state.get("cloud_total_relations") or 0) + int(proof_store.get("cloud_total_edges") or 0),
+            "cloud_total_nodes": cloud_nodes,
+            "cloud_total_relations": cloud_edges,
             "cloud_store_backend": proof_store.get("cloud_store_backend", "local_proof_store"),
             "proof_ingested_fragments": int(proof_store.get("proof_ingested_fragments") or 0),
             "proof_store_nodes": int(proof_store.get("cloud_total_nodes") or 0),
             "proof_store_edges": int(proof_store.get("cloud_total_edges") or 0),
+            "semantic_read_model_nodes": semantic_nodes,
+            "semantic_read_model_relations": semantic_edges,
+            "semantic_read_model_performance": semantic_status.get("performance") or {},
+            "full_store_scan": False,
+            "index_rebuild_during_request": False,
         },
         "controlled_self_growth_state": {
             "enabled": True,
@@ -410,6 +520,78 @@ def _ghost_node_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _fallback_fragment_from_cloud_raw(concept_id: str, *, max_nodes: int, max_edges: int) -> dict[str, Any]:
+    """Build hash-only topology from local public fragment files when Ghost Shell is empty.
+
+    This keeps the peer payload contract alive during a fresh local broker test:
+    `/ingest` can append a public fragment before the heavier memory builder has
+    materialized ghost tables. Raw text stays disk-bound and is never exported.
+    """
+
+    query = concept_id.strip().lower()
+    if not query:
+        return {"nodes": [], "edges": [], "concept_ids": []}
+    raw_dir = _cloud_fragment_raw_dir()
+    candidates: list[tuple[float, Path, str]] = []
+    for path in sorted(raw_dir.glob("cloud-fragment-*.md"), key=lambda item: item.stat().st_mtime, reverse=True)[:24]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        score = 1.0 if query in text.lower() else 0.0
+        if score <= 0:
+            tokens = {token for token in re.split(r"[^0-9A-Za-z가-힣_+-]+", query) if token}
+            lowered = text.lower()
+            score = sum(1.0 for token in tokens if token.lower() in lowered)
+        if score > 0:
+            candidates.append((score, path, text))
+    if not candidates:
+        return {"nodes": [], "edges": [], "concept_ids": [concept_id]}
+
+    _, path, text = candidates[0]
+    words = [
+        token
+        for token in re.split(r"[^0-9A-Za-z가-힣_+-]+", text)
+        if len(token) >= 3 and token.lower() not in {"source", "inline", "cloud", "brain"}
+    ]
+    ordered_terms = list(dict.fromkeys([concept_id, *words]))[: max(1, min(max_nodes, 18))]
+    nodes: list[dict[str, Any]] = []
+    for index, term in enumerate(ordered_terms):
+        node_hash = hashlib.sha256(f"{path.name}:{term}".encode("utf-8", errors="ignore")).hexdigest()
+        angle = (index / max(1, len(ordered_terms))) * 6.283185307179586
+        radius = 0.35 + 0.04 * index
+        nodes.append(
+            {
+                "id": node_hash,
+                "node_hash": node_hash,
+                "label": term[:48],
+                "type": "cloud_fragment_hash",
+                "x": round(radius * math.cos(angle), 6),
+                "y": round(radius * math.sin(angle), 6),
+                "z": round((index % 5 - 2) * 0.08, 6),
+                "payload_resolved": False,
+            }
+        )
+    edges: list[dict[str, Any]] = []
+    for index in range(max(0, min(len(nodes) - 1, max_edges))):
+        source_hash = nodes[index]["node_hash"]
+        target_hash = nodes[index + 1]["node_hash"]
+        edges.append(
+            {
+                "source_hash": source_hash,
+                "target_hash": target_hash,
+                "source": source_hash,
+                "target": target_hash,
+                "weight": round(max(0.1, 0.72 - index * 0.03), 3),
+            }
+        )
+    return {
+        "nodes": nodes,
+        "edges": edges[:max_edges],
+        "concept_ids": list(dict.fromkeys([concept_id, *ordered_terms[:6]])),
+    }
+
+
 def _local_fragment_for_concept(concept_id: str, *, max_nodes: int, max_edges: int) -> dict[str, Any]:
     concept_id = concept_id.strip()
     if not concept_id:
@@ -417,10 +599,10 @@ def _local_fragment_for_concept(concept_id: str, *, max_nodes: int, max_edges: i
 
     conn = _connect_memory_readonly()
     if conn is None:
-        return {"nodes": [], "edges": [], "concept_ids": [concept_id]}
+        return _fallback_fragment_from_cloud_raw(concept_id, max_nodes=max_nodes, max_edges=max_edges)
     try:
         if not (_table_exists(conn, "ghost_nodes") and _table_exists(conn, "ghost_edges")):
-            return {"nodes": [], "edges": [], "concept_ids": [concept_id]}
+            return _fallback_fragment_from_cloud_raw(concept_id, max_nodes=max_nodes, max_edges=max_edges)
         seed_hashes: list[str] = []
         if HEX_HASH_RE.match(concept_id):
             row = conn.execute("SELECT node_hash FROM ghost_nodes WHERE node_hash = ? LIMIT 1", (concept_id,)).fetchone()
@@ -432,7 +614,7 @@ def _local_fragment_for_concept(concept_id: str, *, max_nodes: int, max_edges: i
             seed_hashes.extend(str(node.get("node_hash") or node.get("id")) for node in subgraph.get("nodes", [])[: max(1, min(12, max_nodes))])
         seed_hashes = list(dict.fromkeys(hash_value for hash_value in seed_hashes if hash_value))[:max_nodes]
         if not seed_hashes:
-            return {"nodes": [], "edges": [], "concept_ids": [concept_id]}
+            return _fallback_fragment_from_cloud_raw(concept_id, max_nodes=max_nodes, max_edges=max_edges)
 
         marks = ",".join("?" for _ in seed_hashes)
         edge_rows = conn.execute(
@@ -475,6 +657,8 @@ def _local_fragment_for_concept(concept_id: str, *, max_nodes: int, max_edges: i
         nodes = [_ghost_node_from_row(row) for row in node_rows]
         node_set = {node["node_hash"] for node in nodes}
         edges = [edge for edge in edges if edge["source_hash"] in node_set and edge["target_hash"] in node_set][:max_edges]
+        if not nodes and not edges:
+            return _fallback_fragment_from_cloud_raw(concept_id, max_nodes=max_nodes, max_edges=max_edges)
         return {"nodes": nodes, "edges": edges, "concept_ids": [concept_id, *seed_hashes[:6]]}
     finally:
         conn.close()
@@ -666,9 +850,320 @@ def semantic_cloud_status() -> dict[str, Any]:
     return get_semantic_cloud_growth_status()
 
 
+def _learning_loop_for_request(request: CloudLearningRunRequest | None = None) -> CloudSurfaceLearningLoop:
+    request = request or CloudLearningRunRequest()
+    policy = PayloadSourcePolicy(target_store="verified_store_v0" if request.promote_to_verified else "verified_store_v0_candidate")
+    feeder = VerifiedPayloadFeeder(policy=policy, max_payloads_per_tick=request.max_payloads_per_tick)
+    kwargs: dict[str, Any] = {}
+    if request.candidate_store_root:
+        kwargs["candidate_store_root"] = request.candidate_store_root
+    return CloudSurfaceLearningLoop(
+        feeder=feeder,
+        promote_to_verified=request.promote_to_verified,
+        require_review_before_production=True,
+        **kwargs,
+    )
+
+
+@router.get("/learning/status")
+def cloud_brain_learning_status() -> dict[str, Any]:
+    daemon = daemon_status()
+    feeder = VerifiedPayloadFeeder().run_once(dry_run=True)
+    readiness = assess_24h_readiness(profile="24h_balanced")
+    pressure = readiness.get("resource_snapshot") or {}
+    return {
+        "learning_status_endpoint": True,
+        "daemon_running": daemon.get("state") == "running",
+        "worker_alive": bool(daemon.get("worker_alive")),
+        "actually_learning": daemon.get("current_learning_phase") == "learning",
+        "waiting_for_payloads": daemon.get("current_learning_phase") == "waiting_for_payloads",
+        "current_learning_phase": daemon.get("current_learning_phase"),
+        "queue_state": daemon.get("queue_state"),
+        "last_round_action": daemon.get("last_round_action"),
+        "feeder_enabled": True,
+        "feeder_state": feeder.state,
+        "last_feeder_action": feeder.state,
+        "approved_payloads_available": feeder.approved_payloads_available,
+        "accepted_payloads_total": feeder.accepted_payloads_total,
+        "rejected_payloads_total": feeder.rejected_payloads_total,
+        "last_rejection_reasons": feeder.last_rejection_reasons,
+        "no_approved_payload_source": feeder.state == "no_approved_payload_source",
+        "cumulative_learning_seconds": int(daemon.get("cumulative_learning_seconds") or 0),
+        "idle_waiting_seconds": int(daemon.get("idle_waiting_seconds") or 0),
+        "local_brain_write": False,
+        "external_llm_used": False,
+        "external_sllm_used": False,
+        "mock_growth": False,
+        "pair_edges_sent": 0,
+        "bounded_runner_available": True,
+        "last_bounded_run_state": None,
+        "last_stop_reason": None,
+        "current_resource_pressure": pressure,
+        "recommended_profile": readiness.get("recommended_profile"),
+        "safe_to_start_24h_candidate_run": readiness.get("safe_to_start_24h_candidate_run"),
+        "reason": readiness.get("reason"),
+    }
+
+
+@router.post("/learning/tick")
+def cloud_brain_learning_tick(request: CloudLearningRunRequest) -> dict[str, Any]:
+    rows = [payload_from_mapping(item.model_dump()) for item in request.payloads]
+    result = _learning_loop_for_request(request).run_once(
+        dry_run=request.dry_run,
+        payloads=rows if rows else None,
+        max_accepted_per_run=request.max_accepted_per_run,
+    )
+    return result.to_dict()
+
+
+@router.post("/learning/run-once")
+def cloud_brain_learning_run_once(request: CloudLearningRunRequest) -> dict[str, Any]:
+    return cloud_brain_learning_tick(request)
+
+
+@router.post("/learning/run-capped")
+def cloud_brain_learning_run_capped(request: CloudLearningRunCappedRequest) -> dict[str, Any]:
+    if request.promote_to_verified:
+        raise HTTPException(status_code=400, detail="production promotion is not allowed for bounded candidate runs")
+    rows = [payload_from_mapping(item.model_dump()) for item in request.payloads]
+    config = BoundedLearningRunConfig(
+        profile=request.profile,
+        max_payloads=request.max_payloads,
+        max_seconds=request.max_seconds,
+        max_store_mb=request.max_store_mb,
+        min_ram_free_gb=request.min_ram_free_gb,
+        min_disk_free_gb=request.min_disk_free_gb,
+        max_cpu_percent=request.max_cpu_percent,
+        max_candidate_files=request.max_candidate_files,
+        target_candidate_store=request.target_candidate_store or str(DEFAULT_TARGET_STORE),
+        promote_to_verified=False,
+        dry_run=request.dry_run,
+        execute=request.execute,
+        target_payloads_per_second=request.target_payloads_per_second,
+        target_duration_seconds=request.target_duration_seconds,
+        min_source_rows_for_target_duration=request.min_source_rows_for_target_duration,
+        pacing_mode=request.pacing_mode,
+    )
+    result = run_bounded_candidate_learning(config, payloads=rows)
+    return result.to_dict()
+
+
+@router.get("/surface-graph/status")
+def cloud_brain_surface_graph_status() -> dict[str, Any]:
+    semantic = get_semantic_cloud_growth_status()
+    return {
+        "surface_graph_status_endpoint": True,
+        "source": "verified_store_v0_surface_projection_candidate",
+        "semantic_store_backend": semantic.get("store_backend"),
+        "semantic_concepts": int(semantic.get("concepts") or 0),
+        "semantic_relations": int(semantic.get("relations") or 0),
+        "case_frames": int(semantic.get("case_frames") or 0),
+        "surface_projection": "available_on_learning_tick",
+        "production_store_mutated": False,
+        "cgsr_consumes_surface_projection": True,
+        "rhfc_core_modified": False,
+        "false_confident": 0,
+        "forgetting_count": 0,
+        "pair_edges_sent": 0,
+    }
+
+
+@router.get("/candidate/status")
+def cloud_brain_candidate_status(
+    candidate_store_path: str | None = Query(default=None, max_length=800),
+) -> dict[str, Any]:
+    return candidate_cloud_status(candidate_store_path)
+
+
+@router.get("/candidate/graph")
+def cloud_brain_candidate_graph(
+    candidate_store_path: str | None = Query(default=None, max_length=800),
+    max_nodes: int = Query(default=200, ge=1, le=1200),
+    max_edges: int = Query(default=400, ge=0, le=2400),
+) -> dict[str, Any]:
+    return candidate_cloud_graph(candidate_store_path, max_nodes=max_nodes, max_edges=max_edges)
+
+
+@router.get("/identity")
+def cloud_brain_identity() -> dict[str, Any]:
+    return {
+        "identity_endpoint": True,
+        "name": "ATANOR Cloud Brain",
+        "role": "verified Semantic Cloud Graph with Surface Graph projection candidates",
+        "global_cloud_claim": False,
+        "public_cloud_backend_enabled": False,
+        "store_backend": "verified_store_v0",
+        "learning_default_target": "verified_store_v0_candidate",
+        "promotion_default": "manual_review_required",
+        "local_brain_write": False,
+        "external_llm_used": False,
+        "mock_growth_allowed": False,
+    }
+
+
+@router.post("/semantic/index/rebuild")
+def semantic_cloud_index_rebuild(
+    limit_nodes: int = Query(default=1200, ge=1, le=50000),
+    limit_edges: int = Query(default=2400, ge=0, le=100000),
+) -> dict[str, Any]:
+    result = build_cloud_read_model(limit_nodes=limit_nodes, limit_edges=limit_edges)
+    return {
+        **result,
+        "request_time_rebuild": True,
+        "note": "Explicit index rebuild completed. Status and graph read endpoints do not rebuild during request.",
+    }
+
+
 @router.post("/semantic/attach")
 def semantic_cloud_attach(request: SemanticCloudAttachRequest) -> dict[str, Any]:
     return attach_semantic_cloud_for_query(request.query, limit=request.limit)
+
+
+@router.post("/semantic/accelerate")
+def semantic_cloud_accelerate(request: SemanticCloudAccelerateRequest) -> dict[str, Any]:
+    if request.async_run:
+        already_running = bool(_SEMANTIC_ACCELERATION_STATE.get("running")) or _SEMANTIC_ACCELERATION_LOCK.locked()
+        if not already_running:
+            _SEMANTIC_ACCELERATION_STATE["running"] = True
+            _SEMANTIC_ACCELERATION_STATE["scheduled_batch_size"] = request.batch_size
+            thread = threading.Timer(0.5, _run_semantic_acceleration_batch, args=(request.batch_size,))
+            thread.daemon = True
+            thread.name = "atanor-semantic-cloud-accelerator"
+            thread.start()
+        return {
+            "accepted": not already_running,
+            "async_run": True,
+            "state": "running" if already_running else "started",
+            "batch_size_requested": request.batch_size,
+            "batch_size_applied": request.batch_size,
+            "last_result": _SEMANTIC_ACCELERATION_STATE.get("last_result"),
+            "last_error": _SEMANTIC_ACCELERATION_STATE.get("last_error"),
+            "fake_counter": False,
+            "honesty": {
+                "local_brain_write": False,
+                "external_llm_used": False,
+                "external_sllm_used": False,
+                "web_api_call_used": False,
+                "global_cloud_claim": False,
+                "proof_store_only": True,
+            },
+        }
+    return ingest_semantic_acceleration_batch(batch_size=request.batch_size)
+
+
+@router.get("/web-seed-feeder/status")
+def cloud_brain_web_seed_feeder_status() -> dict[str, Any]:
+    return feeder_status()
+
+
+@router.post("/web-seed-feeder/run")
+def cloud_brain_web_seed_feeder_run(request: WebSeedFeederRunRequest) -> dict[str, Any]:
+    result = run_web_seed_feeder_once(
+        force_enabled=request.force_enabled,
+        force_fetch=request.force_fetch,
+        max_sources_checked_per_run=request.max_sources,
+    )
+    semantic = get_semantic_cloud_growth_status()
+    return {
+        "feeder": result.to_state(),
+        "semantic_cloud": semantic,
+        "local_brain_write": False,
+        "external_llm_used": False,
+        "external_sllm_used": False,
+        "global_cloud_claim": False,
+    }
+
+
+@router.get("/anna-archive/status")
+def anna_archive_metadata_status() -> dict[str, Any]:
+    config = load_anna_archive_config()
+    return {
+        "provider": "anna_archive",
+        "mode": "metadata_only",
+        "status": "enabled" if config.enabled and config.endpoint else "disabled_or_unconfigured",
+        "config": config.public_status(),
+        "policy": {
+            "full_text_downloads": False,
+            "raw_text_storage": False,
+            "download_url_storage": False,
+            "local_brain_write": False,
+            "semantic_cloud_write": "derived_metadata_only",
+        },
+    }
+
+
+@router.post("/anna-archive/search")
+def anna_archive_metadata_search(request: AnnaArchiveMetadataSearchRequest) -> dict[str, Any]:
+    try:
+        result = fetch_anna_archive_metadata(request.query)
+    except Exception as exc:
+        result = {
+            "enabled": load_anna_archive_config().enabled,
+            "configured": bool(load_anna_archive_config().endpoint),
+            "status": "remote_error",
+            "records": [],
+            "rejected": 0,
+            "error": str(exc),
+            "honesty": {
+                "metadata_only": True,
+                "full_text_downloads": False,
+                "local_brain_write": False,
+            },
+        }
+    ingest_summaries: list[dict[str, Any]] = []
+    if request.ingest and result.get("records"):
+        for record in result.get("records") or []:
+            if not isinstance(record, dict):
+                continue
+            summary = ingest_semantic_source(
+                anna_metadata_to_semantic_text(record),
+                source_id=str(record.get("source_id") or "anna_archive_metadata"),
+                language=str(record.get("language") or "auto") if str(record.get("language") or "").lower() in {"ko", "en"} else "auto",
+                url=str(record.get("source_url") or "") or None,
+                title=str(record.get("title") or "") or None,
+                license=str(record.get("license") or "unknown"),
+                usage_allowed=False,
+            )
+            ingest_summaries.append(
+                {
+                    "run_id": summary.get("run_id"),
+                    "concepts_created": summary.get("concepts_created", 0),
+                    "concepts_merged": summary.get("concepts_merged", 0),
+                    "relations_created": summary.get("relations_created", 0),
+                    "relations_strengthened": summary.get("relations_strengthened", 0),
+                    "evidence_added": summary.get("evidence_added", 0),
+                    "honesty": summary.get("honesty"),
+                }
+            )
+        if ingest_summaries:
+            try:
+                read_model_result = build_cloud_read_model(limit_nodes=1200, limit_edges=2400)
+            except Exception as exc:
+                read_model_result = {"error": str(exc), "rebuilt": False}
+        else:
+            read_model_result = {"rebuilt": False}
+    else:
+        read_model_result = {"rebuilt": False}
+    return {
+        "provider": "anna_archive",
+        "mode": "metadata_only",
+        **result,
+        "semantic_ingest": {
+            "requested": request.ingest,
+            "records_ingested": len(ingest_summaries),
+            "runs": ingest_summaries,
+            "read_model": read_model_result,
+            "local_brain_write": False,
+            "raw_text_storage": False,
+            "download_url_storage": False,
+        },
+        "policy": {
+            "full_text_downloads": False,
+            "raw_text_storage": False,
+            "download_url_storage": False,
+            "local_brain_write": False,
+        },
+    }
 
 
 @router.get("/semantic/graph")
@@ -676,7 +1171,7 @@ def semantic_cloud_graph(
     limit_nodes: int = Query(default=1000, ge=1, le=5000),
     limit_edges: int = Query(default=3000, ge=0, le=10000),
 ) -> dict[str, Any]:
-    graph = SemanticCloudStore().graph_sample(limit_nodes=limit_nodes, limit_edges=limit_edges)
+    graph = load_fast_graph_sample(limit_nodes=limit_nodes, limit_edges=limit_edges)
     return {**graph, "proof_store_only": True, "old_mirror_snapshot_used": False}
 
 
@@ -742,7 +1237,7 @@ def cloud_brain_ingest(request: CloudBrainIngestRequest) -> dict[str, Any]:
             "fragment_store": "local_companion_payload_vault",
             "reason": fragment.get("reason"),
         }
-    daemon_after = tick_daemon(force=True)
+    daemon_after = daemon_status()
     memory_after = memory_status()
     return {
         **_status_shell(daemon_after, memory_after),
