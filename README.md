@@ -9,10 +9,38 @@
 
 ATANOR is an experimental AI system that treats knowledge as a living graph instead of hiding it inside opaque model weights. It separates private local memory from public cloud fragments, renders the active reasoning surface, and lets graph cartridges attach read-only into working memory.
 
-![ATANOR graph-native workspace](docs/media/atanor-graph-workspace.png)
+![ATANOR dashboard — the live graph orb](docs/media/atanor-dashboard-orb.png)
+
+## How ATANOR Is Different
+
+ATANOR is **not** another wrapper around a cloud model. It runs on your machine, stores knowledge as a traceable graph, and **answers without calling any external LLM** — so when it has no grounding, it says *"I don't know"* instead of making something up.
+
+|  | **ATANOR** | Cloud LLM (GPT · Claude) | Local LLM (Gemma · Llama) |
+| --- | --- | --- | --- |
+| GPU to answer | **0** | datacenter GPU | consumer GPU |
+| Model download | **~11 MB** | — (server-side) | 2–9 GB |
+| Energy / query | **~0.001 Wh** | ~0.3–3 Wh | ~0.05–0.5 Wh |
+| Knowledge lives in | **traceable graph** | opaque model weights | opaque model weights |
+| When it lacks evidence | **abstains** | may hallucinate | may hallucinate |
+| Answer provenance | **graph path + certificate** | hard to trace | hard to trace |
+| Private data | **stays local** | sent to server | local |
+
+> Cloud/local figures are public estimates (hallucination: Vectara HHEM, etc.) measured under different conditions — treat as directional, not a controlled benchmark.
+
+### Deterministic reasoning — no LLM, no matrix multiply
+
+ATANOR compiles a question into a small operation plan and runs it as a state machine, attaching a step-by-step certificate. Math and multi-step word problems are solved symbolically and **fully offline**:
+
+```text
+Q: 사과 3개 중 1개를 먹고, 2개를 더 샀는데 친구가 2개를 가져가면 몇 개?
+A: 2   ·   start = 3 → 3 − 1 = 2 → 2 + 2 = 4 → 4 − 2 = 2     (no LLM, no GPU)
+```
+
+The same engine refuses to bluff: ask something it can't ground and it abstains rather than fabricate. Honesty is a property of the architecture, not a safety filter bolted on top.
 
 ## Table Of Contents
 
+- [How ATANOR Is Different](#how-atanor-is-different)
 - [Why ATANOR Exists](#why-atanor-exists)
 - [What ATANOR Does Today](#what-atanor-does-today)
 - [How It Works](#how-it-works)
@@ -45,6 +73,7 @@ ATANOR is already more than a static concept document. The current repository co
 
 | Capability | Current state | What to inspect |
 | --- | --- | --- |
+| Reasoning VM | Deterministic math / multi-step word-problem solving with per-step certificates, fully offline, no LLM | `apps/api/app/services/reasoning_vm.py` |
 | Local Brain | Local graph memory, retrieval, answer synthesis, proof fixtures | `packages/rag_engine`, `packages/base_brain` |
 | Cloud Brain | Public semantic fragment store and cloud attachment proofs | `packages/cloud_brain`, `data/cloud_brain/proofs` |
 | Brain Graph | Tab-aware graph projection for local, cloud, and unified views | `packages/brain_graph`, `apps/web/app/page.tsx` |
@@ -97,6 +126,12 @@ http://127.0.0.1:3022/demo
 
 ## Product Screenshots
 
+### Live Dashboard
+
+The dashboard renders ATANOR's active state as a living particle graph (the "orb"), with Local Brain, Cloud Brain, Atlas, AGORA, and Brain Link one click away. The conversation log collapses to a button and slides open ChatGPT-style.
+
+![ATANOR live dashboard](docs/media/atanor-dashboard-orb.png)
+
 ### Graph-Native Workspace
 
 The main workspace renders the active system as a navigable graph surface, with Local Brain, Cloud Brain, Atlas, Graph Hub, and control panels in one interface.
@@ -114,6 +149,12 @@ Graph Hub is not a prompt marketplace. It is a cartridge system for graph data: 
 Cloud Brain and Atlas visualize public graph-fragment state without claiming private local memory as shared cloud intelligence.
 
 ![ATANOR Cloud Brain Atlas](docs/media/atanor-cloud-atlas.png)
+
+### Cloud Graph
+
+The Cloud Graph tab keeps public semantic fragments readable by giving the graph canvas priority and reducing layer diagnostics to a compact summary strip.
+
+![ATANOR Cloud Graph](docs/media/cloud-tab-compact-panel.png)
 
 ## Architecture In One Picture
 
@@ -217,6 +258,9 @@ npm --workspace apps/web run build
 # Run the publication test suite used for this release snapshot
 python -m pytest apps/api/tests packages/rag_engine/tests packages/cloud_brain/tests packages/seed_research/tests packages/cortex_g2/tests packages/q_cortex/tests packages/surface_brain/tests packages/answer_quality/tests packages/base_brain/tests packages/brain_graph/tests packages/graph_hub/tests -q
 
+# Run the release mock/scaffold risk gate; release blockers must stay at zero
+python scripts/audit_release_mock_risks.py
+
 # Run both API and web with the root convenience script
 npm run dev
 
@@ -305,6 +349,8 @@ The long-term vision is a workstation-native intelligence system where:
 - local and cloud intelligence can cooperate without erasing the privacy boundary
 
 In that future, an AI system is not just a model endpoint. It is a living memory architecture: local where it must be private, networked where it can be public, and transparent enough to be corrected.
+
+ATANOR starts as a local-first, honest reasoning OS — but the long-term goal is to grow this owned-by-the-user substrate into a general intelligence built on a different foundation than today's frontier models. We want to build the independent AI company that doesn't yet exist in Korea: open about its limits, owned by its users, and aiming high anyway.
 
 Read the public vision in [docs/VISION.md](docs/VISION.md).
 
